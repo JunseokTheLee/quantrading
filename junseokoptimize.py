@@ -8,123 +8,152 @@ from scipy.stats import pearsonr
 # — your AAPLStrategy as given —
 
 
-class AAPLStrategy(bt.Strategy):
+start_dt = datetime(2023, 3, 22).date()
+end_dt   = datetime(2024, 3, 22).date()
+# — your AAPLStrategy as given —
+class SRLongShortStrategy(bt.Strategy):
     params = dict(
-        # — ultra-short lookbacks for 1-month testing —
-        ema_short     = 3,
-        ema_long      = 6,
-        sma_trend     = 10,
-        rsi_period    = 7,
-        stoch_period  = 7,
-        stoch_smoothk = 2,
-        stoch_smoothd = 2,
-        atr_period    = 5,
+        # Trend filters
+        ema_short     = 5,
+        ema_long      = 20,
+        sma_trend     = 100,
 
-        # take-profit / stop-loss multipliers
-        tp_mult       = 0.8,
-        sl_mult       = 0.4,
+        # Momentum
+        rsi_period    = 20,
+        stoch_period  = 20,
+        stoch_k       = 3,
+        stoch_d       = 3,
 
-        # pullback/time exit
-        pullback_bars = 3,
-        time_exit     = 5,
+        # Volatility stops
+        atr_period    = 14,
 
-        # **NEW**: momentum thresholds to optimize
-        rsi_thresh    = 80,   # entry if RSI < this
-        stoch_thresh  = 80,   # entry if %K < this
-        fade_thresh   = 50,  # exit after 5 bars if nothing else
+        # Support/Resistance
+        sr_period     = 30,
+        sr_tol        = 0.01,   # 1% tolerance
+
+        # Volume filter
+        vol_period    = 5,     # new: lookback for volume MA
+
+        # Position sizing
+        allocation    = 0.5,
+
+        # Profit target & stop-loss
+        tp_mult       = 1.5,
+        sl_mult       = 0.5,
+
+        # Maximum holding duration
+        time_exit     = 30,
     )
 
     def __init__(self):
-        # indicators
-        self.sma    = bt.ind.SMA(self.data.close, period=self.p.sma_trend)
-        self.ema_l  = bt.ind.EMA(self.data.close, period=self.p.ema_long)
-        self.ema_s  = bt.ind.EMA(self.data.close, period=self.p.ema_short)
+        # Trend indicators
+        self.sma200     = bt.ind.SMA(self.data.close, period=self.p.sma_trend)
+        self.ema_short  = bt.ind.EMA(self.data.close, period=self.p.ema_short)
+        self.ema_long   = bt.ind.EMA(self.data.close, period=self.p.ema_long)
 
-        self.rsi    = bt.ind.RSI(self.data.close, period=self.p.rsi_period)
-        stoch       = bt.ind.Stochastic(self.data,
-                                        period=self.p.stoch_period,
-                                        period_dfast=self.p.stoch_smoothk,
-                                        period_dslow=self.p.stoch_smoothd)
-        self.stochK = stoch.percK
+        # Momentum
+        self.rsi        = bt.ind.RSI(self.data.close, period=self.p.rsi_period)
+        stoch           = bt.ind.Stochastic(
+                            self.data,
+                            period=self.p.stoch_period,
+                            period_dfast=self.p.stoch_k,
+                            period_dslow=self.p.stoch_d)
+        self.stoch_k    = stoch.percK
+        self.stoch_d    = stoch.percD
 
-        self.atr    = bt.ind.ATR(self.data, period=self.p.atr_period)
+        # Volatility
+        self.atr        = bt.ind.ATR(self.data, period=self.p.atr_period)
 
-        # trade bookkeeping
-        self.entry_bar   = None
-        self.entry_price = 0.0
-        self.size1       = 0
+        # Support & Resistance levels
+        self.resistance = bt.ind.Highest(self.data.high, period=self.p.sr_period)
+        self.support    = bt.ind.Lowest(self.data.low,  period=self.p.sr_period)
+
+        # Volume filter
+        self.vol_ma     = bt.ind.SMA(self.data.volume, period=self.p.vol_period)
+
+        # Bookkeeping
+        self.entry_bar    = None
+        self.entry_price  = 0.0
 
     def next(self):
         today = self.data.datetime.date(0)
-        # constrain to your 1-month test window
-        if not (datetime(2025,1,22).date() <= today <= datetime(2025,2,22).date()):
+        if not (start_dt <= today <= end_dt):
             return
 
         dt    = len(self)
         pos   = self.position.size
         close = self.data.close[0]
 
-        # 1) TIER-1 ENTRY
+        # ENTRY
         if not pos:
-            trend_ok = (close > self.sma[0]) and (self.ema_l[0] > self.sma[0])
-            mom_ok   = (self.rsi[0] < self.p.rsi_thresh) or (self.stochK[0] < self.p.stoch_thresh)
+            # Base long/short conditions
+            near_sup = close <= self.support[0] * (1 + self.p.sr_tol)
+            long_cond = (
+                close > self.sma200[0]
+                and (self.rsi[0] < 30 or self.stoch_k[0] < 20)
+                and near_sup
+            )
 
-            if trend_ok and mom_ok:
-                size = int((self.broker.getcash() * 0.5) // close)
+            near_res = close >= self.resistance[0] * (1 - self.p.sr_tol)
+            short_cond = (
+                close < self.sma200[0]
+                and (self.rsi[0] > 70 or self.stoch_k[0] > 80)
+                and near_res
+            )
+
+            # NEW: volume must be above its 20-bar MA
+            vol_ok = self.data.volume[0] > self.vol_ma[0]
+
+            if vol_ok and (long_cond or short_cond):
+                size = int((self.broker.getcash() * self.p.allocation) // close)
                 if size:
-                    self.size1       = size
                     self.entry_bar   = dt
                     self.entry_price = close
-                    self.buy(size=size)
-                return
+                    if long_cond:
+                        self.order = self.buy(size=size)
+                    else:
+                        self.order = self.sell(size=size)
+            return
 
-        # 2) TIER-2 PULLBACK (same logic as before)
-        elif pos == self.size1 and dt <= self.entry_bar + self.p.pullback_bars:
-            if (self.data.low[-1] <= self.ema_s[-1] and
-                close > self.ema_s[0]    and
-                close > self.sma[0]):
-                size = int((self.broker.getcash() * 0.5) // close)
-                if size:
-                    self.buy(size=size)
-                return
-
-        # 3) EXITS
+        # EXIT
         if pos:
             atr = self.atr[0]
-            sl  = self.entry_price - atr * self.p.sl_mult
-            tp  = self.entry_price + atr * self.p.tp_mult
+            if pos > 0:
+                sl = self.entry_price - atr * self.p.sl_mult
+                tp = self.entry_price + atr * self.p.tp_mult
+                fade   = self.rsi[0] > 50 or self.stoch_k[0] > self.stoch_d[0]
+                hit_tp = close >= tp
+                hit_sl = close <= sl
+            else:
+                sl = self.entry_price + atr * self.p.sl_mult
+                tp = self.entry_price - atr * self.p.tp_mult
+                fade   = self.rsi[0] < 50 or self.stoch_k[0] < self.stoch_d[0]
+                hit_tp = close <= tp
+                hit_sl = close >= sl
 
-            # stop-loss or take-profit
-            if close <= sl or close >= tp:
+            timeout = dt >= self.entry_bar + self.p.time_exit
+            if hit_tp or hit_sl or fade or timeout:
                 self.close()
-                return
-
-            # fade-out or time-out
-            fade    = (self.rsi[0] > self.p.fade_thresh)
-            timeout = (dt >= self.entry_bar + self.p.time_exit)
-            if fade or timeout:
-                self.close()
-                return
 if __name__ == '__main__':
     cerebro = bt.Cerebro(optreturn=False)
 
     # Define parameter ranges for optimization
     cerebro.optstrategy(
-        AAPLStrategy,
+        SRLongShortStrategy,
+        ema_short=[5,10,15],
+        ema_long=[20,40,60],
+        sma_trend=[100,200],
+        sr_period=[10,20,30],
         
-        ema_long     = [6, 10, 20],
-        sma_trend    = [10, 20, 50],
-        rsi_period   = [7, 14, 21],
-        rsi_thresh   = [60, 70, 80],
-        stoch_thresh = [60, 70, 80],
-        
-        pullback_bars= [2, 3, 5],
+        sl_mult=[0.5,1.0],
+        vol_period =[5,10,15],
         
     )
 
     # Download data
-    df = yf.download('AAPL', start='2015-01-01',
-                     end=datetime.today().strftime('%Y-%m-%d'),multi_level_index=False)
+    df = yf.download('QQQ',
+                     start='2015-01-01',
+                     end=end_dt,multi_level_index=False)
     data = bt.feeds.PandasData(dataname=df)
     cerebro.adddata(data)
 
@@ -151,9 +180,9 @@ if __name__ == '__main__':
         
 
     # Sort by Sharpe ratio descending
-    results.sort(key=lambda x: (x[2] or 0), reverse=True)
+    results.sort(key=lambda x: (x[1] or 0), reverse=True)
 
     # Display top 5 results
-    print("Top 5 parameter sets by Sharpe Ratio:")
+    print("Top 5 parameter sets by Value:")
     for params, value, sharpe, ret in results[:5]:
         print(f"Params: {params}, Final Value: {value:.2f}, Sharpe: {sharpe:}")

@@ -4,114 +4,140 @@ import pandas as pd
 from datetime import datetime
 from scipy.stats import pearsonr
 
-
+start_dt = datetime(2022,3, 22).date()
+end_dt   = datetime(2023, 3, 22).date()
 # — your AAPLStrategy as given —
-class AAPLStrategy(bt.Strategy):
+class SRLongShortStrategy(bt.Strategy):
     params = dict(
-        # — ultra-short lookbacks for 1-month testing —
-        ema_short     = 3,     # 3-day EMA
-        ema_long      = 6,     # 6-day EMA
-        sma_trend     = 10,    # 10-day SMA trend filter
-        corr_period   = 5,     # only if you still use it
-        rsi_period    = 7,     # faster RSI
-        stoch_period  = 7,     # faster Stoch
-        stoch_smoothk = 2,
-        stoch_smoothd = 2,
-        atr_period    = 5,     # tighter ATR
+        # Trend filters
+        ema_short     = 5,
+        ema_long      = 20,
+        sma_trend     = 100,
 
-        # — tighter targets & stops —
-        tp_mult       = 0.8,   # 0.8× ATR
-        sl_mult       = 0.4,   # 0.4× ATR
+        # Momentum
+        rsi_period    = 20,
+        stoch_period  = 20,
+        stoch_k       = 3,
+        stoch_d       = 3,
 
-        # — quicker pullbacks & exits —
-        pullback_bars = 3,     # look for a bounce within 3 bars
-        time_exit     = 5,     # exit after 5 bars if nothing else
+        # Volatility stops
+        atr_period    = 14,
+
+        # Support/Resistance
+        sr_period     = 20,
+        sr_tol        = 0.01,   # 1% tolerance
+
+        # Volume filter
+        vol_period    = 15,     # new: lookback for volume MA
+
+        # Position sizing
+        allocation    = 0.5,
+
+        # Profit target & stop-loss
+        tp_mult       = 1.5,
+        sl_mult       = 0.7,
+
+        # Maximum holding duration
+        time_exit     = 30,
     )
 
     def __init__(self):
-        self.sma10   = bt.ind.SMA(self.data.close, period=self.p.sma_trend)
-        self.ema6    = bt.ind.EMA(self.data.close, period=self.p.ema_long)
-        self.ema3    = bt.ind.EMA(self.data.close, period=self.p.ema_short)
+        # Trend indicators
+        self.sma200     = bt.ind.SMA(self.data.close, period=self.p.sma_trend)
+        self.ema_short  = bt.ind.EMA(self.data.close, period=self.p.ema_short)
+        self.ema_long   = bt.ind.EMA(self.data.close, period=self.p.ema_long)
 
-        self.rsi     = bt.ind.RSI(self.data.close, period=self.p.rsi_period)
-        stoch        = bt.ind.Stochastic(self.data,
-                                         period=self.p.stoch_period,
-                                         period_dfast=self.p.stoch_smoothk,
-                                         period_dslow=self.p.stoch_smoothd)
-        self.stoch_k = stoch.percK
+        # Momentum
+        self.rsi        = bt.ind.RSI(self.data.close, period=self.p.rsi_period)
+        stoch           = bt.ind.Stochastic(
+                            self.data,
+                            period=self.p.stoch_period,
+                            period_dfast=self.p.stoch_k,
+                            period_dslow=self.p.stoch_d)
+        self.stoch_k    = stoch.percK
+        self.stoch_d    = stoch.percD
 
-        self.atr     = bt.ind.ATR(self.data, period=self.p.atr_period)
+        # Volatility
+        self.atr        = bt.ind.ATR(self.data, period=self.p.atr_period)
 
-        self.entry_bar   = None
-        self.entry_price = 0.0
-        self.size1       = 0
-        self.size2       = 0
+        # Support & Resistance levels
+        self.resistance = bt.ind.Highest(self.data.high, period=self.p.sr_period)
+        self.support    = bt.ind.Lowest(self.data.low,  period=self.p.sr_period)
+
+        # Volume filter
+        self.vol_ma     = bt.ind.SMA(self.data.volume, period=self.p.vol_period)
+
+        # Bookkeeping
+        self.entry_bar    = None
+        self.entry_price  = 0.0
 
     def next(self):
         today = self.data.datetime.date(0)
-        # only run in your 1-month window
-        if not (datetime(2024,3,22).date() <= today <= datetime(2024,4,22).date()):
+        if not (start_dt <= today <= end_dt):
             return
 
-        dt  = len(self)
-        pos = self.position.size
+        dt    = len(self)
+        pos   = self.position.size
         close = self.data.close[0]
 
-        # 1) TIER-1 ENTRY
+        # ENTRY
         if not pos:
-            trend_ok = (close > self.sma10[0]) and (self.ema6[0] > self.sma10[0])
-            # much looser momentum
-            mom_ok   = (self.rsi[0] < 80) or (self.stoch_k[0] < 80)
+            # Base long/short conditions
+            near_sup = close <= self.support[0] * (1 + self.p.sr_tol)
+            long_cond = (
+                close > self.sma200[0]
+                and (self.rsi[0] < 30 or self.stoch_k[0] < 20)
+                and near_sup
+            )
 
-            if trend_ok and mom_ok:
-                cash = self.broker.getcash()
-                size = int((cash * 0.5) // close)
+            near_res = close >= self.resistance[0] * (1 - self.p.sr_tol)
+            short_cond = (
+                close < self.sma200[0]
+                and (self.rsi[0] > 70 or self.stoch_k[0] > 80)
+                and near_res
+            )
+
+            # NEW: volume must be above its 20-bar MA
+            vol_ok = self.data.volume[0] > self.vol_ma[0]
+
+            if vol_ok and (long_cond or short_cond):
+                size = int((self.broker.getcash() * self.p.allocation) // close)
                 if size:
-                    self.size1       = size
                     self.entry_bar   = dt
                     self.entry_price = close
-                    self.buy(size=size)
-                return
+                    if long_cond:
+                        self.order = self.buy(size=size)
+                    else:
+                        self.order = self.sell(size=size)
+            return
 
-        # 2) TIER-2 PULLBACK
-        elif pos == self.size1 and dt <= self.entry_bar + self.p.pullback_bars:
-            # bounce off the 6-day EMA
-            if (self.data.low[-1] <= self.ema6[-1] and
-                close > self.ema6[0]   and
-                close > self.sma10[0]):
-                cash = self.broker.getcash()
-                size = int((cash * 0.5) // close)
-                if size:
-                    self.size2 = size
-                    self.buy(size=size)
-                return
-
-        # 3) EXITS
+        # EXIT
         if pos:
             atr = self.atr[0]
-            sl  = self.entry_price - atr*self.p.sl_mult
-            tp  = self.entry_price + atr*self.p.tp_mult
+            if pos > 0:
+                sl = self.entry_price - atr * self.p.sl_mult
+                tp = self.entry_price + atr * self.p.tp_mult
+                fade   = self.rsi[0] > 50 or self.stoch_k[0] > self.stoch_d[0]
+                hit_tp = close >= tp
+                hit_sl = close <= sl
+            else:
+                sl = self.entry_price + atr * self.p.sl_mult
+                tp = self.entry_price - atr * self.p.tp_mult
+                fade   = self.rsi[0] < 50 or self.stoch_k[0] < self.stoch_d[0]
+                hit_tp = close <= tp
+                hit_sl = close >= sl
 
-            # hit stop or target?
-            if close <= sl or close >= tp:
+            timeout = dt >= self.entry_bar + self.p.time_exit
+            if hit_tp or hit_sl or fade or timeout:
                 self.close()
-                return
-
-            # fade or time-out
-            fade = self.rsi[0] > 50
-            timeout = (dt >= self.entry_bar + self.p.time_exit)
-            if fade or timeout:
-                self.close()
-                return
-
 if __name__ == '__main__':
     cerebro = bt.Cerebro()
-    cerebro.addstrategy(AAPLStrategy)
+    cerebro.addstrategy(SRLongShortStrategy)
 
     # 1) Download into a DataFrame
-    df = yf.download('AAPL',
+    df = yf.download('QQQ',
                      start='2015-01-01',
-                     end=datetime.today().strftime('%Y-%m-%d'),multi_level_index=False)
+                     end=end_dt,multi_level_index=False)
 
     # 2) Wrap it—exactly the DataFrame—into PandasData
     datafeed = bt.feeds.PandasData(dataname=df)

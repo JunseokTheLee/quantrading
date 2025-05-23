@@ -5,46 +5,31 @@ from datetime import datetime
 from scipy.stats import pearsonr
 
 
-# — your AAPLStrategy as given —
 
 
-start_dt = datetime(2023, 3, 22).date()
-end_dt   = datetime(2024, 3, 22).date()
-# — your AAPLStrategy as given —
+start_dt = datetime(2022, 1, 22).date()
+end_dt   = datetime(2025, 1, 22).date()
+
 class SRLongShortStrategy(bt.Strategy):
     params = dict(
         # Trend filters
         ema_short     = 5,
         ema_long      = 20,
         sma_trend     = 100,
-
-        # Momentum
         rsi_period    = 20,
         stoch_period  = 20,
         stoch_k       = 3,
         stoch_d       = 3,
-
-        # Volatility stops
-        atr_period    = 14,
-
-        # Support/Resistance
-        sr_period     = 30,
-        sr_tol        = 0.01,   # 1% tolerance
-
-        # Volume filter
-        vol_period    = 5,     # new: lookback for volume MA
-
-        # Position sizing
+        atr_period    = 10,
+        sr_period     = 20,
+        sr_tol        = 0.01,
+        vol_period    = 15,
         allocation    = 0.5,
-
-        # Profit target & stop-loss
         tp_mult       = 1.5,
-        sl_mult       = 0.5,
-
-        # Maximum holding duration
+        sl_mult       = 0.7,
         time_exit     = 30,
     )
-
+    
     def __init__(self):
         # Trend indicators
         self.sma200     = bt.ind.SMA(self.data.close, period=self.p.sma_trend)
@@ -90,7 +75,7 @@ class SRLongShortStrategy(bt.Strategy):
             near_sup = close <= self.support[0] * (1 + self.p.sr_tol)
             long_cond = (
                 close > self.sma200[0]
-                and (self.rsi[0] < 30 or self.stoch_k[0] < 20)
+                and (self.rsi[0] < 40 or self.stoch_k[0] < 30)
                 and near_sup
             )
 
@@ -135,24 +120,28 @@ class SRLongShortStrategy(bt.Strategy):
             if hit_tp or hit_sl or fade or timeout:
                 self.close()
 if __name__ == '__main__':
-    cerebro = bt.Cerebro(optreturn=False)
+    
+    ticker = 'QQQ'
 
+    print(f"\nDownloading {ticker} from {start_dt} to {end_dt} …")
+    df = yf.download(ticker, start=start_dt, end=end_dt, multi_level_index=False)
+    df = df[['Open','High','Low','Close','Volume']].dropna()
+    cerebro = bt.Cerebro(optreturn=False)
+    
     # Define parameter ranges for optimization
     cerebro.optstrategy(
         SRLongShortStrategy,
-        ema_short=[5,10,15],
-        ema_long=[20,40,60],
-        sma_trend=[100,200],
-        sr_period=[10,20,30],
         
-        sl_mult=[0.5,1.0],
-        vol_period =[5,10,15],
+        
+        time_exit = [20,30,40],
+        tp_mult = [1.2,1.5,1.8],
+        sl_mult  = [0.5, 0.7, 1.0]
         
     )
 
     # Download data
     df = yf.download('QQQ',
-                     start='2015-01-01',
+                     # start='2015-01-01',
                      end=end_dt,multi_level_index=False)
     data = bt.feeds.PandasData(dataname=df)
     cerebro.adddata(data)
@@ -179,7 +168,7 @@ if __name__ == '__main__':
         results.append((params, strat.broker.getvalue(), sharpe, ret))
         
 
-    # Sort by Sharpe ratio descending
+    # Sort by final value descending
     results.sort(key=lambda x: (x[1] or 0), reverse=True)
 
     # Display top 5 results

@@ -4,40 +4,25 @@ import pandas as pd
 from datetime import datetime
 from scipy.stats import pearsonr
 
-start_dt = datetime(2022,3, 22).date()
-end_dt   = datetime(2023, 3, 22).date()
-# — your AAPLStrategy as given —
+start_dt = datetime(2022,1, 22).date()#2023- 2024, 2024-2025, 2022-2023
+end_dt   = datetime(2025, 1, 22).date()
+
 class SRLongShortStrategy(bt.Strategy):
     params = dict(
-        # Trend filters
         ema_short     = 5,
         ema_long      = 20,
         sma_trend     = 100,
-
-        # Momentum
         rsi_period    = 20,
         stoch_period  = 20,
         stoch_k       = 3,
         stoch_d       = 3,
-
-        # Volatility stops
-        atr_period    = 14,
-
-        # Support/Resistance
+        atr_period    = 10,
         sr_period     = 20,
-        sr_tol        = 0.01,   # 1% tolerance
-
-        # Volume filter
-        vol_period    = 15,     # new: lookback for volume MA
-
-        # Position sizing
+        sr_tol        = 0.01,
+        vol_period    = 15,
         allocation    = 0.5,
-
-        # Profit target & stop-loss
-        tp_mult       = 1.5,
-        sl_mult       = 0.7,
-
-        # Maximum holding duration
+        tp_mult       = 1.2,
+        sl_mult       = 1.0,
         time_exit     = 30,
     )
 
@@ -60,7 +45,7 @@ class SRLongShortStrategy(bt.Strategy):
         # Volatility
         self.atr        = bt.ind.ATR(self.data, period=self.p.atr_period)
 
-        # Support & Resistance levels
+        # Support & Resistance
         self.resistance = bt.ind.Highest(self.data.high, period=self.p.sr_period)
         self.support    = bt.ind.Lowest(self.data.low,  period=self.p.sr_period)
 
@@ -72,81 +57,77 @@ class SRLongShortStrategy(bt.Strategy):
         self.entry_price  = 0.0
 
     def next(self):
+        # 1) DATE GATING
         today = self.data.datetime.date(0)
         if not (start_dt <= today <= end_dt):
             return
 
-        dt    = len(self)
-        pos   = self.position.size
-        close = self.data.close[0]
+        dt_index = len(self)
+        close    = self.data.close[0]
+        vol_ok   = self.data.volume[0] > self.vol_ma[0]
+        pos_size = self.position.size
 
         # ENTRY
-        if not pos:
-            # Base long/short conditions
-            near_sup = close <= self.support[0] * (1 + self.p.sr_tol)
-            long_cond = (
-                close > self.sma200[0]
-                and (self.rsi[0] < 30 or self.stoch_k[0] < 20)
-                and near_sup
+        if not pos_size and vol_ok:
+            near_sup   = close <= self.support[0] * (1 + self.p.sr_tol)
+            long_cond  = (
+                close > self.sma200[0] and
+                (self.rsi[0] < 40 or self.stoch_k[0] < 30) and
+                near_sup
             )
 
-            near_res = close >= self.resistance[0] * (1 - self.p.sr_tol)
+            near_res   = close >= self.resistance[0] * (1 - self.p.sr_tol)
             short_cond = (
-                close < self.sma200[0]
-                and (self.rsi[0] > 70 or self.stoch_k[0] > 80)
-                and near_res
+                close < self.sma200[0] and
+                (self.rsi[0] > 70 or self.stoch_k[0] > 80) and
+                near_res
             )
 
-            # NEW: volume must be above its 20-bar MA
-            vol_ok = self.data.volume[0] > self.vol_ma[0]
-
-            if vol_ok and (long_cond or short_cond):
+            if long_cond or short_cond:
                 size = int((self.broker.getcash() * self.p.allocation) // close)
                 if size:
-                    self.entry_bar   = dt
+                    self.entry_bar   = dt_index
                     self.entry_price = close
-                    if long_cond:
-                        self.order = self.buy(size=size)
-                    else:
-                        self.order = self.sell(size=size)
+                    self.order = self.buy(size=size) if long_cond else self.sell(size=size)
             return
 
         # EXIT
-        if pos:
-            atr = self.atr[0]
-            if pos > 0:
-                sl = self.entry_price - atr * self.p.sl_mult
-                tp = self.entry_price + atr * self.p.tp_mult
-                fade   = self.rsi[0] > 50 or self.stoch_k[0] > self.stoch_d[0]
-                hit_tp = close >= tp
-                hit_sl = close <= sl
-            else:
-                sl = self.entry_price + atr * self.p.sl_mult
-                tp = self.entry_price - atr * self.p.tp_mult
-                fade   = self.rsi[0] < 50 or self.stoch_k[0] < self.stoch_d[0]
-                hit_tp = close <= tp
-                hit_sl = close >= sl
+        if pos_size:
+            atr     = self.atr[0]
+            is_long = pos_size > 0
+            sl      = (self.entry_price - atr * self.p.sl_mult) if is_long else (self.entry_price + atr * self.p.sl_mult)
+            tp      = (self.entry_price + atr * self.p.tp_mult) if is_long else (self.entry_price - atr * self.p.tp_mult)
 
-            timeout = dt >= self.entry_bar + self.p.time_exit
+            fade    = ((self.rsi[0] > 50 or self.stoch_k[0] > self.stoch_d[0]) if is_long
+                       else (self.rsi[0] < 50 or self.stoch_k[0] < self.stoch_d[0]))
+            hit_tp  = (close >= tp) if is_long else (close <= tp)
+            hit_sl  = (close <= sl) if is_long else (close >= sl)
+            timeout = dt_index >= self.entry_bar + self.p.time_exit
+
             if hit_tp or hit_sl or fade or timeout:
                 self.close()
-if __name__ == '__main__':
-    cerebro = bt.Cerebro()
+
+
+
+def run_backtest(df):
+    """Run Cerebro on df and return final portfolio value."""
+    cerebro = bt.Cerebro(stdstats=False)
     cerebro.addstrategy(SRLongShortStrategy)
-
-    # 1) Download into a DataFrame
-    df = yf.download('QQQ',
-                     start='2015-01-01',
-                     end=end_dt,multi_level_index=False)
-
-    # 2) Wrap it—exactly the DataFrame—into PandasData
     datafeed = bt.feeds.PandasData(dataname=df)
     cerebro.adddata(datafeed)
-
-    # 3) Run as usual
     cerebro.broker.setcash(100_000.0)
     cerebro.broker.setcommission(commission=0.001)
-    print('Starting Value:', cerebro.broker.getvalue())
     cerebro.run()
     print('Final Value:   ', cerebro.broker.getvalue())
     cerebro.plot()
+    return cerebro.broker.getvalue()
+
+
+if __name__ == '__main__':
+    ticker = 'XLK'
+
+    print(f"\nDownloading {ticker} from {start_dt} to {end_dt} …")
+    df = yf.download(ticker, start='2015-01-01', end=end_dt, multi_level_index=False)
+    df = df[['Open','High','Low','Close','Volume']].dropna()
+    obs_value = run_backtest(df)
+    
